@@ -1,0 +1,49 @@
+app:
+  chat-provider:  openai   # anthropic | openai | gemini
+  embed-provider: openai   # openai | gemini
+
+  feedback:
+    file: feedback.json    # path to persist feedback across restarts (relative to working dir)
+
+  finetune:
+    base-model: gpt-4o-mini-2024-07-18   # base model used when starting a fine-tune job
+    min-rating: 4                         # default minimum rating for training data export
+
+spring:
+  config:
+    import: optional:file:.env[.properties]
+
+  application:
+    name: summarize-document
+
+  # Disable ALL provider auto-configurations.
+  # We build each model manually in AIConfig - only the selected provider is constructed.
+  autoconfigure:
+    exclude:
+      # Anthropic
+      - org.springframework.ai.model.anthropic.autoconfigure.AnthropicChatAutoConfiguration
+      # OpenAI - all 5 sub-configs, not just chat/embedding
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
+
+  ai:
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY:}
+
+    openai:
+      api-key: ${OPENAI_API_KEY:}
+
+    gemini:
+      api-key: ${GOOGLE_API_KEY:}
+
+document:
+  files-path: classpath*:files/
+  chunk-size: 800
+  top-k: 5
+
+server:
+  port: 9999
