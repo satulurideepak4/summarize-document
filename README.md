@@ -187,6 +187,7 @@ Runs a semantic search over the ingested documents and generates a grounded answ
 **Example response:**
 ```json
 {
+  "queryId": "a3f7c2d1-8b4e-4f9a-bc12-1234567890ab",
   "answer": "Multi-head attention works by running multiple attention functions in parallel. Each head projects the input into a different subspace, allowing the model to capture different types of relationships simultaneously. The outputs are concatenated and projected to produce the final representation.",
   "sources": [
     {
@@ -200,6 +201,8 @@ Runs a semantic search over the ingested documents and generates a grounded answ
   ]
 }
 ```
+
+Every response includes a `queryId`. You use this ID when submitting feedback on the answer, which feeds into the fine-tuning pipeline described below.
 
 The `sources` array lists every chunk that was sent to the LLM as context. This lets you verify where the answer came from and read the original text if you want more detail.
 
@@ -231,6 +234,335 @@ Returns the current state of the vector store.
 
 ---
 
+## Fine-tuning
+
+### Why the base model is not always enough
+
+A general-purpose model like GPT-4o-mini has never seen your specific documents, your organization's terminology, or the particular way you need answers formatted. Out of the box, RAG gets you most of the way there by providing relevant context, but the model still has to figure out the right tone, the right level of detail, and how to correctly interpret domain-specific language from the context alone. Every time you ask a question, you are relying on the model's generic training to bridge that gap.
+
+Fine-tuning closes that gap permanently. You collect real queries and their ideal answers over time, then use that data to train a specialized version of the model. The fine-tuned model has seen hundreds of examples of your questions paired with good answers in the context of your documents. It learns your domain vocabulary, the answer format you expect, and how to use the retrieved context most effectively. The result is answers that are noticeably more accurate, more concise, and better suited to your use case without needing to change anything about the RAG pipeline itself.
+
+### How the fine-tuning loop works
+
+The process is iterative. You collect feedback on real answers, accumulate enough high-quality examples, train a new model version, activate it, and keep collecting feedback on the improved model to make the next version even better.
+
+```
+    User asks a question
+          |
+          v
+    App returns answer + queryId
+          |
+          v
+    User rates the answer (1 to 5 stars)
+    and optionally provides a corrected answer
+          |
+          v
+    Feedback stored in memory and persisted to feedback.json
+          |
+          v
+    Once enough good feedback is collected (10+ examples rated 4 or 5):
+          |
+          v
+    POST /api/finetune/start
+          |
+          v
+    App exports feedback as JSONL and uploads it to OpenAI
+          |
+          v
+    OpenAI trains a fine-tuned model (takes 15 to 60 minutes typically)
+          |
+          v
+    GET /api/finetune/jobs/{jobId} to check when status = "succeeded"
+          |
+          v
+    POST /api/finetune/activate with the returned fine-tuned model ID
+          |
+          v
+    All subsequent queries use the fine-tuned model automatically
+          |
+          v
+    Continue collecting feedback on the improved model
+    to make the next training run even better
+```
+
+### Step-by-step guide
+
+**Step 1: Ask questions and collect the queryIds**
+
+Every query response now includes a `queryId` field. Save this ID after each query because you will need it to submit feedback.
+
+```bash
+curl -X POST http://localhost:9999/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is the attention mechanism?"}'
+
+# Response includes:
+# "queryId": "a3f7c2d1-8b4e-4f9a-bc12-1234567890ab"
+```
+
+**Step 2: Rate answers and submit feedback**
+
+After reading the answer, rate it from 1 to 5. If the answer was wrong or incomplete, include a corrected version. That corrected answer will be used as the training target instead of the original.
+
+```bash
+curl -X POST http://localhost:9999/api/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queryId": "a3f7c2d1-8b4e-4f9a-bc12-1234567890ab",
+    "rating": 5
+  }'
+
+# If the answer needed improvement:
+curl -X POST http://localhost:9999/api/feedback \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queryId": "a3f7c2d1-8b4e-4f9a-bc12-1234567890ab",
+    "rating": 2,
+    "correctedAnswer": "The attention mechanism works by computing a weighted sum of values, where the weights are determined by the compatibility between a query and the corresponding keys..."
+  }'
+```
+
+Ratings of 4 and 5 are considered good enough for training. Ratings of 1 to 3 are stored but excluded from training data by default. You can inspect your collected feedback at any time:
+
+```bash
+# See all feedback
+curl http://localhost:9999/api/feedback
+
+# See only high-rated feedback (eligible for training)
+curl "http://localhost:9999/api/feedback?minRating=4"
+
+# See a summary with counts and average rating
+curl http://localhost:9999/api/feedback/summary
+```
+
+**Step 3: Check how many training examples you have**
+
+OpenAI requires a minimum of 10 training examples. You can see the count before starting a job:
+
+```bash
+curl http://localhost:9999/api/finetune/status
+
+# Response:
+# {
+#   "overrideActive": false,
+#   "activeModelId": "none (using base model)",
+#   "chatProvider": "openai",
+#   "eligibleExamples": 23
+# }
+```
+
+You can also preview exactly what will be sent to OpenAI by downloading the training file first. This is useful for checking that the examples look correct before spending money on a training run.
+
+```bash
+curl "http://localhost:9999/api/finetune/export?minRating=4" \
+  --output training-preview.jsonl
+
+cat training-preview.jsonl
+```
+
+**Step 4: Start a fine-tuning job**
+
+```bash
+curl -X POST http://localhost:9999/api/finetune/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "minRating": 4,
+    "baseModel": "gpt-4o-mini-2024-07-18",
+    "suffix": "my-docs-v1"
+  }'
+
+# Response:
+# {
+#   "jobId": "ftjob-abc123xyz",
+#   "status": "validating_files",
+#   "baseModel": "gpt-4o-mini-2024-07-18",
+#   "fineTunedModel": null,
+#   "trainingFileId": "file-xyz789",
+#   "createdAt": "2025-01-15T10:30:00Z"
+# }
+```
+
+The job returns immediately. Training happens asynchronously on OpenAI's side and typically takes between 15 minutes and a few hours depending on how many examples you have.
+
+**Step 5: Monitor the job until it finishes**
+
+```bash
+curl http://localhost:9999/api/finetune/jobs/ftjob-abc123xyz
+
+# Keep checking until status = "succeeded"
+# At that point, fineTunedModel will have a value like:
+# "fineTunedModel": "ft:gpt-4o-mini-2024-07-18:your-org:my-docs-v1:abc123"
+```
+
+You can list all your jobs at once to track multiple runs:
+
+```bash
+curl http://localhost:9999/api/finetune/jobs
+```
+
+**Step 6: Activate the fine-tuned model**
+
+Once the job status shows `"succeeded"`, copy the `fineTunedModel` ID and activate it. All queries from this point forward will use the fine-tuned model instead of the base model.
+
+```bash
+curl -X POST http://localhost:9999/api/finetune/activate \
+  -H "Content-Type: application/json" \
+  -d '{"modelId": "ft:gpt-4o-mini-2024-07-18:your-org:my-docs-v1:abc123"}'
+
+# Response:
+# {
+#   "message": "Fine-tuned model activated.",
+#   "modelId": "ft:gpt-4o-mini-2024-07-18:your-org:my-docs-v1:abc123",
+#   "provider": "openai"
+# }
+```
+
+No restart is needed. The model switch happens live. To revert back to the base model at any time:
+
+```bash
+curl -X DELETE http://localhost:9999/api/finetune/activate
+```
+
+### Why fine-tuning gives more accurate results
+
+The reason fine-tuning works is that it shifts responsibility. With a base model, the model has to figure out from the system prompt alone how to behave: how to interpret your documents, how much detail to give, how to handle ambiguous context, and what tone to use. With a fine-tuned model, all of that has been baked in through examples. The model has seen your actual questions paired with correct answers hundreds of times, so it does not have to guess.
+
+Specifically, fine-tuning helps in these ways:
+
+**Domain vocabulary.** If your documents use specialized terms that a general model might misinterpret or paraphrase incorrectly, a fine-tuned model learns what those terms mean in your context. After seeing enough examples, it uses them precisely the way your documents do.
+
+**Handling context correctly.** The RAG system always provides retrieved chunks as context, but a base model does not always use that context in the most effective way. It might over-rely on its general training knowledge instead. A fine-tuned model has been trained specifically on examples where good answers came from correctly reading the provided context, so it learns to prioritize the context over its prior knowledge.
+
+**Consistent answer format.** If you want answers in a specific structure (bullet points, concise summaries, numbered steps), the corrected answers you provide during feedback teach the model exactly what format you prefer. After training, it applies that format consistently without needing it spelled out in every system prompt.
+
+**Fewer hallucinations.** A base model that is unsure about something may fill in gaps with plausible-sounding but incorrect information. A fine-tuned model that has seen many examples of "I don't have enough information to answer this from the provided context" learns that saying so is the right behavior, not a failure.
+
+**Better use of corrections.** When you provide a corrected answer for a low-rated response, you are directly telling the model where it went wrong. That correction becomes a training example that makes the model less likely to make the same mistake again. Over multiple training runs, the model gets systematically better on exactly the kinds of questions your users actually ask.
+
+### Important notes about fine-tuning
+
+Fine-tuning is only available when `app.chat-provider` is set to `openai`. This is because only OpenAI exposes a public fine-tuning API that works the way this pipeline is designed. Anthropic and Gemini do not support the same workflow. You still need an OpenAI API key even if you are using a different provider for regular queries.
+
+OpenAI charges for fine-tuning based on the number of training tokens. At current pricing, a dataset of 50 examples averages roughly $0.10 to $0.30 for a gpt-4o-mini fine-tuning run. The fine-tuned model also costs slightly more per query than the base model. Check OpenAI's pricing page for current rates.
+
+Feedback is saved to `feedback.json` in the project root and survives restarts. The model override set via `/api/finetune/activate` does not survive restarts. After a restart you need to call `/api/finetune/activate` again with the same model ID if you want to continue using the fine-tuned model.
+
+---
+
+## Fine-tuning API reference
+
+### POST /api/feedback
+
+Submits feedback on a query response.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `queryId` | string | yes | The queryId from the query response |
+| `rating` | integer | yes | Score from 1 (bad) to 5 (perfect) |
+| `correctedAnswer` | string | no | A better answer to use as the training target |
+
+```json
+{
+  "feedbackId": "fb-123",
+  "queryId": "a3f7c2d1-...",
+  "status": "recorded",
+  "message": "Feedback saved. Rating: 5/5."
+}
+```
+
+---
+
+### GET /api/feedback
+
+Lists all stored feedback. Pass `?minRating=4` to filter to training-eligible entries only.
+
+---
+
+### GET /api/feedback/summary
+
+Returns counts and averages across all collected feedback.
+
+```json
+{
+  "total": 47,
+  "averageRating": 3.8,
+  "ratingDistribution": { "1": 3, "2": 5, "3": 8, "4": 18, "5": 13 },
+  "eligibleForTraining": 31
+}
+```
+
+---
+
+### DELETE /api/feedback/{id}
+
+Removes a specific feedback entry from the store and from `feedback.json`.
+
+---
+
+### POST /api/finetune/start
+
+Exports eligible feedback as JSONL, uploads it to OpenAI, and starts a fine-tuning job.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `minRating` | integer | no | 4 | Minimum rating to include in training |
+| `baseModel` | string | no | gpt-4o-mini-2024-07-18 | Base model to fine-tune from |
+| `suffix` | string | no | none | Optional label appended to the model name |
+
+Returns the initial job status. The job runs asynchronously.
+
+---
+
+### GET /api/finetune/jobs
+
+Lists the 20 most recent fine-tuning jobs.
+
+---
+
+### GET /api/finetune/jobs/{jobId}
+
+Returns the current status of a specific job. Poll this until `status` is `"succeeded"` or `"failed"`.
+
+---
+
+### POST /api/finetune/jobs/{jobId}/cancel
+
+Cancels a job that is still running.
+
+---
+
+### GET /api/finetune/export
+
+Downloads the training data that would be sent to OpenAI as a `.jsonl` file. Does not start a job. Useful for previewing or auditing the training examples before committing.
+
+| Param | Default | Description |
+|---|---|---|
+| `minRating` | 4 | Minimum rating to include |
+
+---
+
+### POST /api/finetune/activate
+
+Activates a fine-tuned model for all subsequent queries. No restart needed.
+
+```json
+{ "modelId": "ft:gpt-4o-mini-2024-07-18:your-org:suffix:abc123" }
+```
+
+---
+
+### DELETE /api/finetune/activate
+
+Reverts all queries back to the base model.
+
+---
+
+### GET /api/finetune/status
+
+Shows which model is currently active, how many eligible training examples exist, and which chat provider is configured.
+
+---
+
 ## Configuration reference
 
 All configuration lives in `src/main/resources/application.yml`.
@@ -242,6 +574,14 @@ app:
   embed-provider: openai      # which model to use for embeddings
                               # options: openai | gemini
                               # (anthropic is not an option here - no public embedding API)
+
+  feedback:
+    file: feedback.json       # where to persist feedback across restarts
+                              # relative to working directory, or use an absolute path
+
+  finetune:
+    base-model: gpt-4o-mini-2024-07-18   # default base model for fine-tuning jobs
+    min-rating: 4                         # default minimum rating for training data export
 
 document:
   files-path: classpath*:files/   # where to look for PDFs
@@ -305,24 +645,42 @@ src/
     java/com/example/summarize/
       config/
         AIConfig.java                 picks and wires the chat and embed providers at startup
+        OpenAiRestClientConfig.java   RestClient bean used for OpenAI fine-tuning API calls
       controller/
         DocumentController.java       handles /api/documents/* endpoints
         QueryController.java          handles /api/query
+        FeedbackController.java       handles /api/feedback/* endpoints
+        FineTuningController.java     handles /api/finetune/* endpoints
         GlobalExceptionHandler.java   turns exceptions into proper HTTP responses
       model/
         QueryRequest.java             request body for /api/query
-        QueryResponse.java            response body with answer and sources
+        QueryResponse.java            response body (answer, sources, queryId)
+        QueryCacheEntry.java          internal cache entry holding question, context, answer
         SourceChunk.java              one retrieved chunk with its metadata
         IngestResponse.java           response body for /api/documents/ingest
+        FeedbackRequest.java          request body for POST /api/feedback
+        FeedbackEntry.java            stored feedback record (persisted to feedback.json)
+        FeedbackResponse.java         response body for POST /api/feedback
+        FineTuneRequest.java          request body for POST /api/finetune/start
+        FineTuneStatusResponse.java   fine-tuning job status from OpenAI
+        ActivateModelRequest.java     request body for POST /api/finetune/activate
       service/
         DocumentIngestionService.java reads PDFs, chunks them, stores embeddings
-        QueryService.java             runs similarity search and calls the LLM
+        QueryService.java             runs similarity search, calls the LLM, caches queries
+        QueryCacheService.java        bounded in-memory cache of the last 1000 queries
+        FeedbackService.java          stores feedback in memory, persists to feedback.json
+        TrainingDataService.java      exports feedback as OpenAI fine-tuning JSONL
+        FineTuningService.java        calls OpenAI file upload and fine-tuning APIs
+        ModelOverrideHolder.java      thread-safe holder for the active fine-tuned model ID
     resources/
       application.yml                 all configuration
       files/                          drop your PDFs here
   test/
     java/com/example/summarize/
       SummarizeDocumentApplicationTests.java
+
+feedback.json                         feedback persisted across restarts (created at runtime)
+.env                                  API keys (never committed)
 ```
 
 ---
@@ -346,6 +704,24 @@ The LLM is instructed to answer only from the provided context. If it seems to b
 
 **Vectors lost after restart**
 This is expected. The in-memory vector store does not persist to disk by default. Call `/api/documents/ingest` again after each restart, or configure a storage file as described in the Configuration section above.
+
+**"Query not found for id" when submitting feedback**
+The query cache holds the last 1000 queries in memory and is cleared on restart. If the server was restarted since you made the query, the queryId is no longer available. Make the query again and submit feedback before the next restart.
+
+**"Not enough training examples" when starting a fine-tune job**
+You need at least 10 feedback entries with a rating of 4 or 5. Check the count at `GET /api/finetune/status`. Keep asking questions and rating answers until you reach the threshold.
+
+**"OPENAI_API_KEY is required for fine-tuning"**
+Fine-tuning always uses OpenAI's API regardless of which chat provider you use for regular queries. Set `OPENAI_API_KEY` in your `.env` file.
+
+**"Model override only works when app.chat-provider=openai"**
+Fine-tuned models are OpenAI models and can only be used when the chat provider is set to openai. If you are using Anthropic or Gemini for chat, you cannot activate a fine-tuned GPT model as an override. You would need to switch `app.chat-provider` to `openai` first.
+
+**Fine-tuned model override lost after restart**
+The active model override is stored in memory and does not survive restarts. After restarting, call `POST /api/finetune/activate` again with your model ID. The model ID is available from `GET /api/finetune/jobs/{jobId}` anytime after the job succeeds.
+
+**Fine-tuning job shows status "failed"**
+Check the `error` field in the job status response for the reason. Common causes are: the training file had fewer than 10 valid examples, the base model name was incorrect, or the OpenAI account hit a fine-tuning quota. Fix the issue and start a new job.
 
 ---
 
