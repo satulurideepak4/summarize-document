@@ -3,6 +3,8 @@ package com.example.summarize.service;
 import com.example.summarize.model.QueryCacheEntry;
 import com.example.summarize.model.QueryResponse;
 import com.example.summarize.model.SourceChunk;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -26,18 +28,20 @@ public class QueryService {
     private final ChatClient chatClient;
     private final QueryCacheService queryCacheService;
     private final ModelOverrideHolder modelOverrideHolder;
+    private final MeterRegistry meterRegistry;
 
-    private static final int DEFAULT_TOP_K       = 5;
-    private static final int MAX_CONTEXT_CHARS   = 4000;
-    private static final int MAX_RETRIES         = 3;
-    private static final long BASE_BACKOFF_MS    = 1000;
-
-    // Gemini free tier allows 15 RPM, so we space calls out to avoid hitting the limit.
-    private long lastCallTime = 0;
-    private static final long MIN_INTERVAL_MS = 15000;
+    private static final int    DEFAULT_TOP_K    = 5;
+    private static final int    MAX_RETRIES      = 3;
+    private static final long   BASE_BACKOFF_MS  = 1000;
 
     @Value("${app.chat-provider:openai}")
     private String chatProvider;
+
+    @Value("${document.max-context-chars:12000}")
+    private int maxContextChars;
+
+    @Value("${document.similarity-threshold:0.70}")
+    private double similarityThreshold;
 
     private static final String SYSTEM_PROMPT = """
             You are an intelligent document assistant. Your job is to answer questions
@@ -54,21 +58,27 @@ public class QueryService {
     public QueryService(VectorStore vectorStore,
                         ChatClient chatClient,
                         QueryCacheService queryCacheService,
-                        ModelOverrideHolder modelOverrideHolder) {
-        this.vectorStore        = vectorStore;
-        this.chatClient         = chatClient;
-        this.queryCacheService  = queryCacheService;
+                        ModelOverrideHolder modelOverrideHolder,
+                        MeterRegistry meterRegistry) {
+        this.vectorStore         = vectorStore;
+        this.chatClient          = chatClient;
+        this.queryCacheService   = queryCacheService;
         this.modelOverrideHolder = modelOverrideHolder;
+        this.meterRegistry       = meterRegistry;
     }
 
     public QueryResponse query(String question, Integer topKOverride) {
         String queryId = UUID.randomUUID().toString();
         int topK = resolveTopK(topKOverride);
-        log.info("Query received | queryId={} | topK={} | question={}", queryId, topK, question);
+        log.info("Query | queryId={} topK={} question={}", queryId, topK, question);
+
+        Timer.Sample total = Timer.start(meterRegistry);
 
         List<Document> relevantDocs = retrieveDocuments(question, topK);
 
         if (relevantDocs.isEmpty()) {
+            meterRegistry.counter("query.empty_results").increment();
+            total.stop(meterRegistry.timer("query.latency", "result", "empty"));
             return new QueryResponse(queryId,
                     "No relevant content found. Please ingest documents first.",
                     List.of());
@@ -79,6 +89,8 @@ public class QueryService {
         List<SourceChunk> sources = mapSources(relevantDocs);
 
         queryCacheService.put(queryId, new QueryCacheEntry(question, context, answer));
+        meterRegistry.counter("query.success").increment();
+        total.stop(meterRegistry.timer("query.latency", "result", "success"));
 
         return new QueryResponse(queryId, answer, sources);
     }
@@ -88,12 +100,18 @@ public class QueryService {
     }
 
     private List<Document> retrieveDocuments(String question, int topK) {
-        return vectorStore.similaritySearch(
-                SearchRequest.builder()
-                        .query(question)
-                        .topK(topK)
-                        .build()
-        );
+        Timer.Sample sample = Timer.start(meterRegistry);
+        try {
+            return vectorStore.similaritySearch(
+                    SearchRequest.builder()
+                            .query(question)
+                            .topK(topK)
+                            .similarityThreshold(similarityThreshold)
+                            .build()
+            );
+        } finally {
+            sample.stop(meterRegistry.timer("retrieval.latency"));
+        }
     }
 
     private String buildContextWithLimit(List<Document> docs) {
@@ -102,15 +120,10 @@ public class QueryService {
         for (int i = 0; i < docs.size(); i++) {
             Document doc = docs.get(i);
             String text = doc.getText();
-
-            if (text.length() > 800) {
-                text = text.substring(0, 800);
-            }
-
-            String file  = (String) doc.getMetadata().getOrDefault("source_file", "unknown");
+            String file = (String) doc.getMetadata().getOrDefault("source_file", "unknown");
             String chunk = "[Chunk " + (i + 1) + " | Source: " + file + "]\n" + text + "\n\n";
 
-            if (sb.length() + chunk.length() > MAX_CONTEXT_CHARS) break;
+            if (sb.length() + chunk.length() > maxContextChars) break;
             sb.append(chunk);
         }
 
@@ -120,66 +133,68 @@ public class QueryService {
     private String generateAnswerWithRetry(String question, String context) {
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             try {
-                enforceRateLimit();
+                Timer.Sample sample = Timer.start(meterRegistry);
+                try {
+                    var spec = chatClient.prompt()
+                            .system(SYSTEM_PROMPT)
+                            .user(u -> u.text("""
+                                    Context:
+                                    ===
+                                    {context}
+                                    ===
 
-                var spec = chatClient.prompt()
-                        .system(SYSTEM_PROMPT)
-                        .user(u -> u.text("""
-                                Context:
-                                ===
-                                {context}
-                                ===
+                                    Question: {question}
+                                    """)
+                                    .param("context", context)
+                                    .param("question", question));
 
-                                Question: {question}
-                                """)
-                                .param("context", context)
-                                .param("question", question));
-
-                // Apply fine-tuned model override when available and provider supports it.
-                // OpenAiChatOptions is OpenAI-specific; silently skip for other providers.
-                if ("openai".equalsIgnoreCase(chatProvider)) {
-                    var override = modelOverrideHolder.get();
-                    if (override.isPresent()) {
-                        log.debug("Using fine-tuned model: {}", override.get());
-                        spec = spec.options(OpenAiChatOptions.builder()
-                                .model(override.get())
-                                .build());
+                    // Fine-tuned model override is OpenAI-specific.
+                    if ("openai".equalsIgnoreCase(chatProvider)) {
+                        var override = modelOverrideHolder.get();
+                        if (override.isPresent()) {
+                            log.debug("Using fine-tuned model: {}", override.get());
+                            spec = spec.options(OpenAiChatOptions.builder()
+                                    .model(override.get())
+                                    .build());
+                        }
                     }
-                }
 
-                return spec.call().content();
+                    String result = spec.call().content();
+                    sample.stop(meterRegistry.timer("llm.latency", "attempt", String.valueOf(attempt + 1)));
+                    return result;
+
+                } catch (Exception ex) {
+                    sample.stop(meterRegistry.timer("llm.latency", "attempt", String.valueOf(attempt + 1)));
+                    throw ex;
+                }
 
             } catch (Exception ex) {
                 if (isRateLimitError(ex)) {
                     long backoff = (long) Math.pow(2, attempt) * BASE_BACKOFF_MS;
-                    log.warn("Rate limit hit. Retrying in {} ms (attempt {})", backoff, attempt + 1);
+                    log.warn("Rate limit hit on attempt {}. Retrying in {} ms.", attempt + 1, backoff);
+                    meterRegistry.counter("llm.rate_limit_hits").increment();
                     sleep(backoff);
                 } else {
-                    log.error("LLM call failed", ex);
+                    log.error("LLM call failed on attempt {}", attempt + 1, ex);
                     throw ex;
                 }
             }
         }
 
-        throw new RuntimeException("Failed after retries due to rate limiting.");
-    }
-
-    private void enforceRateLimit() {
-        long now      = System.currentTimeMillis();
-        long waitTime = MIN_INTERVAL_MS - (now - lastCallTime);
-        if (waitTime > 0) sleep(waitTime);
-        lastCallTime = System.currentTimeMillis();
+        throw new RuntimeException("LLM call failed after " + MAX_RETRIES + " retries due to rate limiting.");
     }
 
     private boolean isRateLimitError(Exception ex) {
-        return ex.getMessage() != null && ex.getMessage().contains("429");
+        String msg = ex.getMessage();
+        return msg != null && (msg.contains("429") || msg.toLowerCase().contains("rate limit"));
     }
 
     private void sleep(long ms) {
         try {
             TimeUnit.MILLISECONDS.sleep(ms);
-        } catch (InterruptedException ignored) {
+        } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for rate limit backoff", e);
         }
     }
 

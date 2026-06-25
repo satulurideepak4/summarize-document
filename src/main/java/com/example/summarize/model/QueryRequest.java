@@ -1,9 +1,11 @@
 package com.example.summarize.model;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 
 public class QueryRequest {
     @NotBlank(message = "question must not be blank")
+    @Size(max = 2000, message = "question must not exceed 2000 characters")
     public String question;
     public Integer topK;
 

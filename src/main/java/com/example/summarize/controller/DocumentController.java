@@ -34,9 +34,10 @@ public class DocumentController {
     @GetMapping("/status")
     public ResponseEntity<Map<String, Object>> status() {
         return ResponseEntity.ok(Map.of(
-                "ingested", ingestionService.isIngested(),
+                "ingested",      ingestionService.isIngested(),
+                "ingesting",     ingestionService.isIngesting(),
                 "ingestedFiles", ingestionService.getIngestedFiles(),
-                "totalChunks", ingestionService.getTotalChunksStored()
+                "totalChunks",   ingestionService.getTotalChunksStored()
         ));
     }
 }

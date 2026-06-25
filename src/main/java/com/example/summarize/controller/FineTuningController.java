@@ -60,8 +60,6 @@ public class FineTuningController {
         return ResponseEntity.ok(fineTuningService.cancelJob(jobId));
     }
 
-    // Downloads the current training data as a JSONL file without starting a job.
-    // Useful for inspecting what will be sent to OpenAI before committing.
     @GetMapping("/export")
     public ResponseEntity<byte[]> exportTrainingData(
             @RequestParam(value = "minRating", defaultValue = "4") int minRating) throws IOException {
@@ -78,8 +76,6 @@ public class FineTuningController {
         }
     }
 
-    // Activates a fine-tuned model for all subsequent queries.
-    // Only works when app.chat-provider=openai.
     @PostMapping("/activate")
     public ResponseEntity<Map<String, String>> activate(@Valid @RequestBody ActivateModelRequest request) {
         if (!"openai".equalsIgnoreCase(chatProvider)) {
@@ -95,7 +91,6 @@ public class FineTuningController {
         ));
     }
 
-    // Reverts to the base model configured in application.yml.
     @DeleteMapping("/activate")
     public ResponseEntity<Map<String, String>> deactivate() {
         String previous = modelOverrideHolder.get().orElse("none");

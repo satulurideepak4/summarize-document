@@ -3,11 +3,11 @@ app:
   embed-provider: openai   # openai | gemini
 
   feedback:
-    file: feedback.json    # path to persist feedback across restarts (relative to working dir)
+    file: feedback.json    # path to persist feedback (relative to working dir or absolute)
 
   finetune:
-    base-model: gpt-4o-mini-2024-07-18   # base model used when starting a fine-tune job
-    min-rating: 4                         # default minimum rating for training data export
+    base-model: gpt-4o-mini-2024-07-18
+    min-rating: 4
 
 spring:
   config:
@@ -16,13 +16,18 @@ spring:
   application:
     name: summarize-document
 
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  mvc:
+    async:
+      request-timeout: 120s
+
   # Disable ALL provider auto-configurations.
   # We build each model manually in AIConfig - only the selected provider is constructed.
   autoconfigure:
     exclude:
-      # Anthropic
       - org.springframework.ai.model.anthropic.autoconfigure.AnthropicChatAutoConfiguration
-      # OpenAI - all 5 sub-configs, not just chat/embedding
       - org.springframework.ai.model.openai.autoconfigure.OpenAiChatAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiEmbeddingAutoConfiguration
       - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
@@ -33,10 +38,8 @@ spring:
   ai:
     anthropic:
       api-key: ${ANTHROPIC_API_KEY:}
-
     openai:
       api-key: ${OPENAI_API_KEY:}
-
     gemini:
       api-key: ${GOOGLE_API_KEY:}
 
@@ -44,6 +47,53 @@ document:
   files-path: classpath*:files/
   chunk-size: 800
   top-k: 5
+  # How much text is sent to the LLM as context per query.
+  # 12000 chars is roughly 3000 tokens - well within gpt-4o-mini's 128k context.
+  max-context-chars: 12000
+  # Minimum cosine similarity to include a chunk in results.
+  # 0.70 filters out loosely related chunks. Raise to 0.80 for stricter relevance.
+  similarity-threshold: 0.70
 
 server:
   port: 9999
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 100
+      min-spare: 10
+    connection-timeout: 30s
+    max-connections: 500
+    accept-count: 100
+    max-http-form-post-size: 50MB
+  compression:
+    enabled: true
+    mime-types: application/json,text/plain
+    min-response-size: 2048
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    defaults:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{correlationId:-}] %-5level %logger{36} - %msg%n"
+  level:
+    root: INFO
+    com.example.summarize: INFO
