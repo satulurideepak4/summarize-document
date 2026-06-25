@@ -6,6 +6,37 @@ You can swap between Anthropic (Claude), OpenAI (GPT), or Google Gemini by chang
 
 ---
 
+## Table of contents
+
+- [What problem does this solve](#what-problem-does-this-solve)
+- [How the RAG pipeline works](#how-the-rag-pipeline-works)
+  - [Phase 1 - Ingestion](#phase-1---ingestion)
+  - [Phase 2 - Querying](#phase-2---querying)
+  - [Why this works better than sending the whole PDF](#why-this-works-better-than-sending-the-whole-pdf)
+- [Prerequisites](#prerequisites)
+- [Setup](#setup)
+- [Health and metrics](#health-and-metrics)
+- [Correlation IDs](#correlation-ids)
+- [API reference](#api-reference)
+  - [POST /api/documents/ingest](#post-apidocumentsingest)
+  - [POST /api/query](#post-apiquery)
+  - [GET /api/documents/list](#get-apidocumentslist)
+  - [GET /api/documents/status](#get-apidocumentsstatus)
+- [Fine-tuning](#fine-tuning)
+  - [Why the base model is not always enough](#why-the-base-model-is-not-always-enough)
+  - [How the fine-tuning loop works](#how-the-fine-tuning-loop-works)
+  - [Step-by-step guide](#step-by-step-guide)
+  - [Why fine-tuning gives more accurate results](#why-fine-tuning-gives-more-accurate-results)
+  - [Important notes about fine-tuning](#important-notes-about-fine-tuning)
+- [Fine-tuning API reference](#fine-tuning-api-reference)
+- [Configuration reference](#configuration-reference)
+- [Provider comparison](#provider-comparison)
+- [Project structure](#project-structure)
+- [Troubleshooting](#troubleshooting)
+- [Things worth knowing](#things-worth-knowing)
+
+---
+
 ## What problem does this solve
 
 Reading through long PDFs to find specific information is slow. This app lets you ask a question like "What are the key risks mentioned in section 3?" and get a direct answer with references to which file and which section it came from. It works across multiple PDFs at once, so you can ask a question that spans several documents and it will pull from whichever ones are relevant.
