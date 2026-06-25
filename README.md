@@ -22,10 +22,10 @@ There are two distinct phases: ingestion (happens once) and querying (happens ev
 
 ```mermaid
 flowchart TD
-    A[PDF Files in files/] --> B[PagePdfDocumentReader\nreads page by page]
-    B --> C[TokenTextSplitter\n800-token chunks]
-    C --> D[Embedding Model\ntext to float vector]
-    D --> E[SimpleVectorStore\nin-memory with source metadata]
+    A[PDF Files] --> B[PagePdfDocumentReader]
+    B --> C[TokenTextSplitter - 800-token chunks]
+    C --> D[Embedding Model]
+    D --> E[SimpleVectorStore - in-memory]
 ```
 
 When you call `POST /api/documents/ingest`, the app scans the files directory for all PDFs, reads each one, splits the text into chunks, generates an embedding vector for each chunk, and stores everything in memory. The vectors are lost when the app restarts, so you need to call ingest again after each restart.
@@ -38,11 +38,11 @@ Each chunk carries metadata like `source_file` so answers can cite where they ca
 
 ```mermaid
 flowchart TD
-    A[Your question] --> B[Embedding Model\nquestion to vector]
-    B --> C[Cosine Similarity Search\ntop K chunks above threshold]
-    C --> D[Prompt Builder\nchunks as context]
-    D --> E[LLM\nClaude / GPT / Gemini]
-    E --> F[Response\nanswer + source chunks]
+    A[Your question] --> B[Embedding Model]
+    B --> C[Cosine Similarity Search - top K chunks]
+    C --> D[Prompt Builder]
+    D --> E[LLM - Claude / GPT / Gemini]
+    E --> F[Response - answer and source chunks]
 ```
 
 When you call `POST /api/query`, the app embeds your question, runs a similarity search (filtering out chunks below the `similarity-threshold`), builds a prompt with those chunks as context, calls the LLM, and returns the answer along with the source chunks. Every response includes a `queryId` that you use when submitting feedback.
@@ -276,15 +276,15 @@ Fine-tuning closes that gap. You collect real queries and their ideal answers ov
 
 ```mermaid
 flowchart TD
-    A[User asks a question] --> B[App returns answer + queryId]
-    B --> C[User rates answer 1-5\noptional corrected answer]
+    A[User asks a question] --> B[App returns answer and queryId]
+    B --> C[User rates answer 1-5, optional correction]
     C --> D[Feedback saved to feedback.json]
-    D --> E{10+ examples\nrated 4 or 5?}
+    D --> E{10+ examples rated 4 or 5?}
     E -- No, keep collecting --> A
     E -- Yes --> F[POST /api/finetune/start]
     F --> G[Export JSONL and upload to OpenAI]
-    G --> H[OpenAI trains fine-tuned model\n15 to 60 minutes]
-    H --> I[Poll GET /api/finetune/jobs/jobId\nuntil status = succeeded]
+    G --> H[OpenAI trains fine-tuned model - 15 to 60 min]
+    H --> I[Poll until status = succeeded]
     I --> J[POST /api/finetune/activate]
     J --> K[All queries use fine-tuned model]
     K --> A
