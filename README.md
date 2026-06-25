@@ -20,13 +20,7 @@ There are two distinct phases: ingestion (happens once) and querying (happens ev
 
 ### Phase 1 - Ingestion
 
-```mermaid
-flowchart TD
-    A[PDF Files] --> B[PagePdfDocumentReader]
-    B --> C[TokenTextSplitter - 800-token chunks]
-    C --> D[Embedding Model]
-    D --> E[SimpleVectorStore - in-memory]
-```
+![Ingestion pipeline](docs/diagram1_ingestion.png)
 
 When you call `POST /api/documents/ingest`, the app scans the files directory for all PDFs, reads each one, splits the text into chunks, generates an embedding vector for each chunk, and stores everything in memory. The vectors are lost when the app restarts, so you need to call ingest again after each restart.
 
@@ -36,14 +30,7 @@ Each chunk carries metadata like `source_file` so answers can cite where they ca
 
 ### Phase 2 - Querying
 
-```mermaid
-flowchart TD
-    A[Your question] --> B[Embedding Model]
-    B --> C[Cosine Similarity Search - top K chunks]
-    C --> D[Prompt Builder]
-    D --> E[LLM - Claude / GPT / Gemini]
-    E --> F[Response - answer and source chunks]
-```
+![Query pipeline](docs/diagram2_query.png)
 
 When you call `POST /api/query`, the app embeds your question, runs a similarity search (filtering out chunks below the `similarity-threshold`), builds a prompt with those chunks as context, calls the LLM, and returns the answer along with the source chunks. Every response includes a `queryId` that you use when submitting feedback.
 
@@ -56,8 +43,8 @@ Vector similarity search finds chunks that are semantically similar to your ques
 ## Prerequisites
 
 - Java 21 or higher
-- Maven (or use the included `mvnw` wrapper)
-- An API key for at least one provider (see the Provider Comparison section below)
+  - Maven (or use the included `mvnw` wrapper)
+  - An API key for at least one provider (see the Provider Comparison section below)
 
 ---
 
@@ -164,8 +151,8 @@ Every request is assigned a correlation ID. If the request includes an `X-Correl
 
 The correlation ID appears in:
 - Every log line for that request (via MDC)
-- The `X-Correlation-Id` response header
-- Error responses from the exception handler
+  - The `X-Correlation-Id` response header
+  - Error responses from the exception handler
 
 This makes it straightforward to trace a specific request through the logs:
 
@@ -274,21 +261,7 @@ Fine-tuning closes that gap. You collect real queries and their ideal answers ov
 
 ### How the fine-tuning loop works
 
-```mermaid
-flowchart TD
-    A[User asks a question] --> B[App returns answer and queryId]
-    B --> C[User rates answer 1-5, optional correction]
-    C --> D[Feedback saved to feedback.json]
-    D --> E{10+ examples rated 4 or 5?}
-    E -- No, keep collecting --> A
-    E -- Yes --> F[POST /api/finetune/start]
-    F --> G[Export JSONL and upload to OpenAI]
-    G --> H[OpenAI trains fine-tuned model - 15 to 60 min]
-    H --> I[Poll until status = succeeded]
-    I --> J[POST /api/finetune/activate]
-    J --> K[All queries use fine-tuned model]
-    K --> A
-```
+![Fine-tuning feedback loop](docs/diagram3_feedback_loop.png)
 
 ### Step-by-step guide
 
